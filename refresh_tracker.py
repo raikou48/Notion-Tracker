@@ -6,15 +6,8 @@ refresh_tracker.py
 Refreshes the "Task Status Tracker" toggle on the Task section
 (Academics and Personal) page in Notion.
 
-Uses the Notion API version 2025-09-03 with the data sources endpoint.
-
-Reads the "Status" property (not "Status (1)") and maps its four values
-into the three tracker buckets:
-
-    To do                  → Not started
-    To do- daily/weekly    → Not started   (recurring tasks)
-    In progress            → In progress
-    Archive                → Done
+Reads the "Tasks" data source (the one with Status values
+Not started / In progress / Done) and counts each task by status.
 
 Requires:
     pip install requests
@@ -37,37 +30,20 @@ except Exception:
 
 
 # ---------------------------------------------------------------------------
-# Configuration — these IDs are specific to your Notion workspace.
+# Configuration
 # ---------------------------------------------------------------------------
 
-# The Task DATA SOURCE (the table inside the database container).
-DATA_SOURCE_ID = "16727f2c884583a6bf398738a4305ada"
+# The "Tasks" data source (the real one your tasks live in).
+DATA_SOURCE_ID = "36427f2c88458053b5ab000b5ce37518"
 
 # The "Task section (Academics and Personal)" page that holds the toggle.
 PARENT_PAGE_ID = "f9c27f2c8845823a837201565a531822"
 
-# Substring used to identify the toggle to update on the parent page.
 TOGGLE_TITLE_CONTAINS = "Task Status Tracker"
 
-# Which Notion status property to read.
+# Status property and the values to count, in display order.
 STATUS_PROPERTY = "Status"
-
-# Maps the raw Notion status values into the three tracker buckets.
-# Any status value not in this map is ignored entirely.
-STATUS_MAPPING: dict[str, str] = {
-    "To do": "Not started",
-    "To do- daily/weekly": "Not started",
-    "In progress": "In progress",
-    "Archive": "Done",
-}
-
-# The three tracker buckets in display order.
 BUCKETS = ["Not started", "In progress", "Done"]
-
-
-# ---------------------------------------------------------------------------
-# Notion API helpers
-# ---------------------------------------------------------------------------
 
 API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2025-09-03"
@@ -76,10 +52,7 @@ NOTION_VERSION = "2025-09-03"
 def _headers() -> dict[str, str]:
     token = os.environ.get("NOTION_TOKEN")
     if not token:
-        sys.stderr.write(
-            "ERROR: NOTION_TOKEN environment variable is not set. "
-            "Add it as a GitHub Actions secret or export it locally.\n"
-        )
+        sys.stderr.write("ERROR: NOTION_TOKEN is not set.\n")
         sys.exit(1)
     return {
         "Authorization": f"Bearer {token}",
@@ -88,8 +61,11 @@ def _headers() -> dict[str, str]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Notion API helpers
+# ---------------------------------------------------------------------------
+
 def query_all_tasks() -> list[dict[str, Any]]:
-    """Return every page in the task data source (handles pagination)."""
     tasks: list[dict[str, Any]] = []
     cursor: str | None = None
     while True:
@@ -115,22 +91,14 @@ def query_all_tasks() -> list[dict[str, Any]]:
 
 def count_by_status(tasks: list[dict[str, Any]]) -> dict[str, int]:
     counts = {bucket: 0 for bucket in BUCKETS}
-    unknown: list[str] = []
     for t in tasks:
         prop = (t.get("properties") or {}).get(STATUS_PROPERTY) or {}
-        if prop.get("type") == "status":
-            status_obj = prop.get("status") or {}
-            name = status_obj.get("name")
-            bucket = STATUS_MAPPING.get(name) if name else None
-            if bucket:
-                counts[bucket] += 1
-            elif name:
-                unknown.append(name)
-    if unknown:
-        sys.stderr.write(
-            f"Note: {len(unknown)} task(s) had unmapped status values: "
-            f"{sorted(set(unknown))}\n"
-        )
+        if prop.get("type") != "status":
+            continue
+        status_obj = prop.get("status") or {}
+        name = status_obj.get("name")
+        if name in counts:
+            counts[name] += 1
     return counts
 
 
@@ -152,27 +120,21 @@ def list_block_children(block_id: str) -> list[dict[str, Any]]:
 
 
 def delete_block(block_id: str) -> None:
-    r = requests.delete(
+    requests.delete(
         f"{API_BASE}/blocks/{block_id}", headers=_headers(), timeout=30
-    )
-    r.raise_for_status()
+    ).raise_for_status()
 
 
-def append_children(
-    block_id: str, children: list[dict[str, Any]]
-) -> dict[str, Any]:
-    r = requests.patch(
+def append_children(block_id: str, children: list[dict[str, Any]]) -> None:
+    requests.patch(
         f"{API_BASE}/blocks/{block_id}/children",
         headers=_headers(),
         json={"children": children},
         timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
+    ).raise_for_status()
 
 
 def find_tracker_toggle() -> str:
-    """Locate the heading_3 toggle block whose title contains the tracker name."""
     for block in list_block_children(PARENT_PAGE_ID):
         if block.get("type") == "heading_3":
             h = block.get("heading_3", {})
@@ -183,14 +145,12 @@ def find_tracker_toggle() -> str:
                 if TOGGLE_TITLE_CONTAINS in text:
                     return block["id"]
     raise RuntimeError(
-        f"Could not find a toggle heading containing "
-        f"'{TOGGLE_TITLE_CONTAINS}' on page {PARENT_PAGE_ID}. "
-        f"Has it been moved or renamed?"
+        f"Could not find toggle on page {PARENT_PAGE_ID}."
     )
 
 
 # ---------------------------------------------------------------------------
-# Block construction helpers
+# Block construction
 # ---------------------------------------------------------------------------
 
 def _text(content: str, bold: bool = False) -> dict[str, Any]:
@@ -205,10 +165,7 @@ def _paragraph(rich_text: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _heading_1(content: str) -> dict[str, Any]:
-    return {
-        "type": "heading_1",
-        "heading_1": {"rich_text": [_text(content)]},
-    }
+    return {"type": "heading_1", "heading_1": {"rich_text": [_text(content)]}}
 
 
 def _quote(rich_text: list[dict[str, Any]]) -> dict[str, Any]:
@@ -224,21 +181,16 @@ def _column_list(columns: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def build_tracker_blocks(counts: dict[str, int]) -> list[dict[str, Any]]:
-    not_started = counts["Not started"]
-    in_progress = counts["In progress"]
-    done = counts["Done"]
-    total = not_started + in_progress + done
+    ns = counts["Not started"]
+    ip = counts["In progress"]
+    dn = counts["Done"]
+    total = ns + ip + dn
 
     def pct(n: int) -> str:
         return f"{round(100 * n / total)}% of total" if total else "—"
 
-    now = (
-        datetime.datetime.now(LOCAL_TZ) if LOCAL_TZ
-        else datetime.datetime.utcnow()
-    )
-    timestamp = now.strftime("%b %d, %Y at %I:%M %p %Z").strip()
-    if timestamp.endswith("AM ") or timestamp.endswith("PM "):
-        timestamp = timestamp.rstrip()
+    now = datetime.datetime.now(LOCAL_TZ) if LOCAL_TZ else datetime.datetime.utcnow()
+    timestamp = now.strftime("%b %d, %Y at %I:%M %p %Z").strip().rstrip()
 
     refresh_note = _quote([
         _text("🔄 "),
@@ -247,20 +199,19 @@ def build_tracker_blocks(counts: dict[str, int]) -> list[dict[str, Any]]:
     ])
 
     columns_data = [
-        ("🔴 ", "Not started", not_started, pct(not_started)),
-        ("🟡 ", "In progress", in_progress, pct(in_progress)),
-        ("🟢 ", "Done", done, pct(done)),
+        ("🔴 ", "Not started", ns, pct(ns)),
+        ("🟡 ", "In progress", ip, pct(ip)),
+        ("🟢 ", "Done", dn, pct(dn)),
     ]
 
-    column_blocks = []
-    for emoji, label, n, p in columns_data:
-        column_blocks.append(
-            _column([
-                _quote([_text(emoji), _text(label, bold=True)]),
-                _heading_1(str(n)),
-                _paragraph([_text(p)]),
-            ])
-        )
+    column_blocks = [
+        _column([
+            _quote([_text(emoji), _text(label, bold=True)]),
+            _heading_1(str(n)),
+            _paragraph([_text(p)]),
+        ])
+        for emoji, label, n, p in columns_data
+    ]
 
     total_line = _paragraph([
         _text(f"{total} tasks total", bold=True),
@@ -271,11 +222,11 @@ def build_tracker_blocks(counts: dict[str, int]) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Main flow
+# Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    print("→ Querying task data source…")
+    print("→ Querying Tasks data source…")
     tasks = query_all_tasks()
     print(f"  Found {len(tasks)} tasks.")
 
@@ -284,18 +235,12 @@ def main() -> None:
 
     print("→ Locating tracker toggle…")
     toggle_id = find_tracker_toggle()
-    print(f"  Toggle block id: {toggle_id}")
 
-    print("→ Removing existing toggle contents…")
-    existing = list_block_children(toggle_id)
-    for child in existing:
+    print("→ Rewriting toggle contents…")
+    for child in list_block_children(toggle_id):
         delete_block(child["id"])
-    print(f"  Removed {len(existing)} block(s).")
-
-    print("→ Writing new toggle contents…")
-    new_blocks = build_tracker_blocks(counts)
-    append_children(toggle_id, new_blocks)
-    print("  Done. ✓")
+    append_children(toggle_id, build_tracker_blocks(counts))
+    print("→ Done. ✓")
 
 
 if __name__ == "__main__":
