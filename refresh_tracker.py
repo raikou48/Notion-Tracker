@@ -6,10 +6,13 @@ refresh_tracker.py
 Refreshes BOTH "Task Status Tracker" and "Task Type Tracker" toggles
 on the Task section (Academics and Personal) page.
 
-  • Task Status Tracker — counts by the Status property
+  • Task Status Tracker — counts EVERY active task by Status
       (Not started / In progress / Done)
-  • Task Type Tracker   — counts by the Type property
+  • Task Type Tracker   — counts ACTIVE tasks excluding Done by Type
       (Personal / Academic / Academic & Personal)
+
+Archived and trashed tasks are filtered out from every tracker, so the
+totals match what you actually see in your Notion view.
 
 Requires: pip install requests
 """
@@ -37,8 +40,6 @@ except Exception:
 DATA_SOURCE_ID = "36427f2c88458053b5ab000b5ce37518"
 PARENT_PAGE_ID = "f9c27f2c8845823a837201565a531822"
 
-# Each tracker is a dict describing which toggle to update, which property to
-# read, and which buckets to display. Add another tracker by appending here.
 TRACKERS: list[dict[str, Any]] = [
     {
         "toggle_title": "Task Status Tracker",
@@ -54,6 +55,7 @@ TRACKERS: list[dict[str, Any]] = [
         "toggle_title": "Task Type Tracker",
         "property_name": "Type",
         "property_type": "multi_select",
+        "exclude_status": ["Done"],
         "buckets": [
             {"emoji": "🟠 ", "label": "Personal"},
             {"emoji": "🟣 ", "label": "Academic"},
@@ -83,7 +85,8 @@ def _headers() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def query_all_tasks() -> list[dict[str, Any]]:
-    tasks: list[dict[str, Any]] = []
+    """Return every active (non-archived, non-trashed) task in the data source."""
+    raw: list[dict[str, Any]] = []
     cursor: str | None = None
     while True:
         body: dict[str, Any] = {"page_size": 100}
@@ -99,11 +102,27 @@ def query_all_tasks() -> list[dict[str, Any]]:
             sys.stderr.write(f"Query failed ({r.status_code}): {r.text}\n")
         r.raise_for_status()
         data = r.json()
-        tasks.extend(data["results"])
+        raw.extend(data["results"])
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")
-    return tasks
+
+    # Strip archived / trashed pages. Notion's query returns them by default.
+    active = [
+        t for t in raw
+        if not t.get("in_trash", False) and not t.get("archived", False)
+    ]
+    dropped = len(raw) - len(active)
+    if dropped:
+        print(f"  Filtered out {dropped} archived/trashed task(s).")
+    return active
+
+
+def get_status_name(task: dict[str, Any]) -> str | None:
+    prop = (task.get("properties") or {}).get("Status") or {}
+    if prop.get("type") != "status":
+        return None
+    return ((prop.get("status") or {}).get("name")) or None
 
 
 def count_by_property(
@@ -166,7 +185,6 @@ def append_children(block_id: str, children: list[dict[str, Any]]) -> None:
 
 
 def find_toggle(title_contains: str) -> str | None:
-    """Return the block id of the heading_3 toggle whose title contains the substring."""
     for block in list_block_children(PARENT_PAGE_ID):
         if block.get("type") == "heading_3":
             h = block.get("heading_3", {})
@@ -211,7 +229,9 @@ def _column_list(columns: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def build_tracker_blocks(
-    counts: dict[str, int], buckets: list[dict[str, str]]
+    counts: dict[str, int],
+    buckets: list[dict[str, str]],
+    exclude_note: str | None = None,
 ) -> list[dict[str, Any]]:
     total = sum(counts.values())
 
@@ -221,11 +241,15 @@ def build_tracker_blocks(
     now = datetime.datetime.now(LOCAL_TZ) if LOCAL_TZ else datetime.datetime.utcnow()
     timestamp = now.strftime("%b %d, %Y at %I:%M %p %Z").strip().rstrip()
 
-    refresh_note = _quote([
+    refresh_parts = [
         _text("🔄 "),
         _text("Auto-refreshed by GitHub Actions every hour.", bold=True),
-        _text(f"  Last refresh: {timestamp}."),
-    ])
+    ]
+    if exclude_note:
+        refresh_parts.append(_text(f"  {exclude_note}"))
+    refresh_parts.append(_text(f"  Last refresh: {timestamp}."))
+
+    refresh_note = _quote(refresh_parts)
 
     column_blocks = []
     for bucket in buckets:
@@ -256,9 +280,23 @@ def refresh_tracker(tasks: list[dict[str, Any]], config: dict[str, Any]) -> None
     title = config["toggle_title"]
     print(f"\n→ {title}")
 
+    exclude_status = config.get("exclude_status") or []
+    if exclude_status:
+        filtered = [t for t in tasks if get_status_name(t) not in exclude_status]
+        excluded = len(tasks) - len(filtered)
+        exclude_note = (
+            "Active tasks only — excludes "
+            + " or ".join(f'\"{s}\"' for s in exclude_status)
+            + "."
+        )
+        print(f"  Filtered out {excluded} task(s) with status in {exclude_status}.")
+    else:
+        filtered = tasks
+        exclude_note = None
+
     bucket_labels = [b["label"] for b in config["buckets"]]
     counts = count_by_property(
-        tasks, config["property_name"], config["property_type"], bucket_labels
+        filtered, config["property_name"], config["property_type"], bucket_labels
     )
     print(f"  Counts: {counts}")
 
@@ -269,14 +307,16 @@ def refresh_tracker(tasks: list[dict[str, Any]], config: dict[str, Any]) -> None
 
     for child in list_block_children(toggle_id):
         delete_block(child["id"])
-    append_children(toggle_id, build_tracker_blocks(counts, config["buckets"]))
-    print(f"  Updated. ✓")
+    append_children(
+        toggle_id, build_tracker_blocks(counts, config["buckets"], exclude_note)
+    )
+    print("  Updated. ✓")
 
 
 def main() -> None:
     print("→ Querying Tasks data source…")
     tasks = query_all_tasks()
-    print(f"  Found {len(tasks)} tasks.")
+    print(f"  {len(tasks)} active task(s).")
 
     for config in TRACKERS:
         refresh_tracker(tasks, config)
