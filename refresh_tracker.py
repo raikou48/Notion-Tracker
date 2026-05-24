@@ -243,7 +243,7 @@ def build_tracker_blocks(
 
     refresh_parts = [
         _text("🔄 "),
-        _text("Auto-refreshed by GitHub Actions every hour.", bold=True),
+        _text("Auto-refreshed by GitHub Actions every 5 minutes.", bold=True),
     ]
     if exclude_note:
         refresh_parts.append(_text(f"  {exclude_note}"))
