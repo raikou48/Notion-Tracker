@@ -3,14 +3,15 @@
 refresh_tracker.py
 ==================
 
-Refreshes the "Task Status Tracker" toggle on the Task section
-(Academics and Personal) page in Notion.
+Refreshes BOTH "Task Status Tracker" and "Task Type Tracker" toggles
+on the Task section (Academics and Personal) page.
 
-Reads the "Tasks" data source (the one with Status values
-Not started / In progress / Done) and counts each task by status.
+  • Task Status Tracker — counts by the Status property
+      (Not started / In progress / Done)
+  • Task Type Tracker   — counts by the Type property
+      (Personal / Academic / Academic & Personal)
 
-Requires:
-    pip install requests
+Requires: pip install requests
 """
 
 from __future__ import annotations
@@ -33,17 +34,33 @@ except Exception:
 # Configuration
 # ---------------------------------------------------------------------------
 
-# The "Tasks" data source (the real one your tasks live in).
 DATA_SOURCE_ID = "36427f2c88458053b5ab000b5ce37518"
-
-# The "Task section (Academics and Personal)" page that holds the toggle.
 PARENT_PAGE_ID = "f9c27f2c8845823a837201565a531822"
 
-TOGGLE_TITLE_CONTAINS = "Task Status Tracker"
-
-# Status property and the values to count, in display order.
-STATUS_PROPERTY = "Status"
-BUCKETS = ["Not started", "In progress", "Done"]
+# Each tracker is a dict describing which toggle to update, which property to
+# read, and which buckets to display. Add another tracker by appending here.
+TRACKERS: list[dict[str, Any]] = [
+    {
+        "toggle_title": "Task Status Tracker",
+        "property_name": "Status",
+        "property_type": "status",
+        "buckets": [
+            {"emoji": "🔴 ", "label": "Not started"},
+            {"emoji": "🟡 ", "label": "In progress"},
+            {"emoji": "🟢 ", "label": "Done"},
+        ],
+    },
+    {
+        "toggle_title": "Task Type Tracker",
+        "property_name": "Type",
+        "property_type": "multi_select",
+        "buckets": [
+            {"emoji": "🟠 ", "label": "Personal"},
+            {"emoji": "🟣 ", "label": "Academic"},
+            {"emoji": "🟡 ", "label": "Academic & Personal"},
+        ],
+    },
+]
 
 API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2025-09-03"
@@ -89,16 +106,30 @@ def query_all_tasks() -> list[dict[str, Any]]:
     return tasks
 
 
-def count_by_status(tasks: list[dict[str, Any]]) -> dict[str, int]:
-    counts = {bucket: 0 for bucket in BUCKETS}
+def count_by_property(
+    tasks: list[dict[str, Any]],
+    prop_name: str,
+    prop_type: str,
+    bucket_labels: list[str],
+) -> dict[str, int]:
+    counts = {label: 0 for label in bucket_labels}
     for t in tasks:
-        prop = (t.get("properties") or {}).get(STATUS_PROPERTY) or {}
-        if prop.get("type") != "status":
+        prop = (t.get("properties") or {}).get(prop_name) or {}
+        if prop.get("type") != prop_type:
             continue
-        status_obj = prop.get("status") or {}
-        name = status_obj.get("name")
-        if name in counts:
-            counts[name] += 1
+        if prop_type == "status":
+            name = ((prop.get("status") or {}).get("name")) or ""
+            if name in counts:
+                counts[name] += 1
+        elif prop_type == "multi_select":
+            for option in prop.get("multi_select") or []:
+                name = option.get("name") or ""
+                if name in counts:
+                    counts[name] += 1
+        elif prop_type == "select":
+            name = ((prop.get("select") or {}).get("name")) or ""
+            if name in counts:
+                counts[name] += 1
     return counts
 
 
@@ -134,7 +165,8 @@ def append_children(block_id: str, children: list[dict[str, Any]]) -> None:
     ).raise_for_status()
 
 
-def find_tracker_toggle() -> str:
+def find_toggle(title_contains: str) -> str | None:
+    """Return the block id of the heading_3 toggle whose title contains the substring."""
     for block in list_block_children(PARENT_PAGE_ID):
         if block.get("type") == "heading_3":
             h = block.get("heading_3", {})
@@ -142,11 +174,9 @@ def find_tracker_toggle() -> str:
                 text = "".join(
                     rt.get("plain_text", "") for rt in h.get("rich_text", [])
                 )
-                if TOGGLE_TITLE_CONTAINS in text:
+                if title_contains in text:
                     return block["id"]
-    raise RuntimeError(
-        f"Could not find toggle on page {PARENT_PAGE_ID}."
-    )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -180,11 +210,10 @@ def _column_list(columns: list[dict[str, Any]]) -> dict[str, Any]:
     return {"type": "column_list", "column_list": {"children": columns}}
 
 
-def build_tracker_blocks(counts: dict[str, int]) -> list[dict[str, Any]]:
-    ns = counts["Not started"]
-    ip = counts["In progress"]
-    dn = counts["Done"]
-    total = ns + ip + dn
+def build_tracker_blocks(
+    counts: dict[str, int], buckets: list[dict[str, str]]
+) -> list[dict[str, Any]]:
+    total = sum(counts.values())
 
     def pct(n: int) -> str:
         return f"{round(100 * n / total)}% of total" if total else "—"
@@ -198,20 +227,18 @@ def build_tracker_blocks(counts: dict[str, int]) -> list[dict[str, Any]]:
         _text(f"  Last refresh: {timestamp}."),
     ])
 
-    columns_data = [
-        ("🔴 ", "Not started", ns, pct(ns)),
-        ("🟡 ", "In progress", ip, pct(ip)),
-        ("🟢 ", "Done", dn, pct(dn)),
-    ]
-
-    column_blocks = [
-        _column([
-            _quote([_text(emoji), _text(label, bold=True)]),
-            _heading_1(str(n)),
-            _paragraph([_text(p)]),
-        ])
-        for emoji, label, n, p in columns_data
-    ]
+    column_blocks = []
+    for bucket in buckets:
+        emoji = bucket["emoji"]
+        label = bucket["label"]
+        n = counts.get(label, 0)
+        column_blocks.append(
+            _column([
+                _quote([_text(emoji), _text(label, bold=True)]),
+                _heading_1(str(n)),
+                _paragraph([_text(pct(n))]),
+            ])
+        )
 
     total_line = _paragraph([
         _text(f"{total} tasks total", bold=True),
@@ -225,22 +252,36 @@ def build_tracker_blocks(counts: dict[str, int]) -> list[dict[str, Any]]:
 # Main
 # ---------------------------------------------------------------------------
 
+def refresh_tracker(tasks: list[dict[str, Any]], config: dict[str, Any]) -> None:
+    title = config["toggle_title"]
+    print(f"\n→ {title}")
+
+    bucket_labels = [b["label"] for b in config["buckets"]]
+    counts = count_by_property(
+        tasks, config["property_name"], config["property_type"], bucket_labels
+    )
+    print(f"  Counts: {counts}")
+
+    toggle_id = find_toggle(title)
+    if not toggle_id:
+        print(f"  WARN: toggle '{title}' not found on the page; skipping.")
+        return
+
+    for child in list_block_children(toggle_id):
+        delete_block(child["id"])
+    append_children(toggle_id, build_tracker_blocks(counts, config["buckets"]))
+    print(f"  Updated. ✓")
+
+
 def main() -> None:
     print("→ Querying Tasks data source…")
     tasks = query_all_tasks()
     print(f"  Found {len(tasks)} tasks.")
 
-    counts = count_by_status(tasks)
-    print(f"  Counts: {counts}")
+    for config in TRACKERS:
+        refresh_tracker(tasks, config)
 
-    print("→ Locating tracker toggle…")
-    toggle_id = find_tracker_toggle()
-
-    print("→ Rewriting toggle contents…")
-    for child in list_block_children(toggle_id):
-        delete_block(child["id"])
-    append_children(toggle_id, build_tracker_blocks(counts))
-    print("→ Done. ✓")
+    print("\n→ All trackers refreshed. Done. ✓")
 
 
 if __name__ == "__main__":
