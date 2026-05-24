@@ -6,8 +6,15 @@ refresh_tracker.py
 Refreshes the "Task Status Tracker" toggle on the Task section
 (Academics and Personal) page in Notion.
 
-Uses the Notion API version 2025-09-03, which introduced "data sources"
-as separate entities from databases.
+Uses the Notion API version 2025-09-03 with the data sources endpoint.
+
+Reads the "Status" property (not "Status (1)") and maps its four values
+into the three tracker buckets:
+
+    To do                  → Not started
+    To do- daily/weekly    → Not started   (recurring tasks)
+    In progress            → In progress
+    Archive                → Done
 
 Requires:
     pip install requests
@@ -33,7 +40,7 @@ except Exception:
 # Configuration — these IDs are specific to your Notion workspace.
 # ---------------------------------------------------------------------------
 
-# The Task DATA SOURCE (not the database container — the table inside it).
+# The Task DATA SOURCE (the table inside the database container).
 DATA_SOURCE_ID = "16727f2c884583a6bf398738a4305ada"
 
 # The "Task section (Academics and Personal)" page that holds the toggle.
@@ -42,9 +49,20 @@ PARENT_PAGE_ID = "f9c27f2c8845823a837201565a531822"
 # Substring used to identify the toggle to update on the parent page.
 TOGGLE_TITLE_CONTAINS = "Task Status Tracker"
 
-# Status property and the three buckets we count.
-STATUS_PROPERTY = "Status (1)"
-STATUSES = ["To do", "In progress", "Done"]
+# Which Notion status property to read.
+STATUS_PROPERTY = "Status"
+
+# Maps the raw Notion status values into the three tracker buckets.
+# Any status value not in this map is ignored entirely.
+STATUS_MAPPING: dict[str, str] = {
+    "To do": "Not started",
+    "To do- daily/weekly": "Not started",
+    "In progress": "In progress",
+    "Archive": "Done",
+}
+
+# The three tracker buckets in display order.
+BUCKETS = ["Not started", "In progress", "Done"]
 
 
 # ---------------------------------------------------------------------------
@@ -85,9 +103,7 @@ def query_all_tasks() -> list[dict[str, Any]]:
             timeout=30,
         )
         if not r.ok:
-            sys.stderr.write(
-                f"Query failed ({r.status_code}): {r.text}\n"
-            )
+            sys.stderr.write(f"Query failed ({r.status_code}): {r.text}\n")
         r.raise_for_status()
         data = r.json()
         tasks.extend(data["results"])
@@ -98,14 +114,23 @@ def query_all_tasks() -> list[dict[str, Any]]:
 
 
 def count_by_status(tasks: list[dict[str, Any]]) -> dict[str, int]:
-    counts = {name: 0 for name in STATUSES}
+    counts = {bucket: 0 for bucket in BUCKETS}
+    unknown: list[str] = []
     for t in tasks:
         prop = (t.get("properties") or {}).get(STATUS_PROPERTY) or {}
         if prop.get("type") == "status":
             status_obj = prop.get("status") or {}
             name = status_obj.get("name")
-            if name in counts:
-                counts[name] += 1
+            bucket = STATUS_MAPPING.get(name) if name else None
+            if bucket:
+                counts[bucket] += 1
+            elif name:
+                unknown.append(name)
+    if unknown:
+        sys.stderr.write(
+            f"Note: {len(unknown)} task(s) had unmapped status values: "
+            f"{sorted(set(unknown))}\n"
+        )
     return counts
 
 
@@ -199,7 +224,7 @@ def _column_list(columns: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def build_tracker_blocks(counts: dict[str, int]) -> list[dict[str, Any]]:
-    not_started = counts["To do"]
+    not_started = counts["Not started"]
     in_progress = counts["In progress"]
     done = counts["Done"]
     total = not_started + in_progress + done
