@@ -1,0 +1,29 @@
+name: Refresh Notion Tracker
+
+on:
+  schedule:
+    # Runs at minute 0 of every hour (UTC).
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    # Lets you click "Run workflow" in the Actions tab to refresh on demand.
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install --quiet requests
+
+      - name: Run refresh script
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+        run: python refresh_tracker.py
+
