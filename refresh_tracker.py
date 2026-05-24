@@ -6,15 +6,8 @@ refresh_tracker.py
 Refreshes the "Task Status Tracker" toggle on the Task section
 (Academics and Personal) page in Notion.
 
-Workflow:
-  1. Query every page in the Task database.
-  2. Count tasks by the "Status (1)" property: To do / In progress / Done.
-  3. Find the toggle on the parent page by its title.
-  4. Wipe the toggle's existing contents and rewrite them with fresh
-     three-column metric cards and an updated timestamp.
-
-Intended to run on a schedule via GitHub Actions, but can also be run
-locally for testing (just set NOTION_TOKEN in your shell).
+Uses the Notion API version 2025-09-03, which introduced "data sources"
+as separate entities from databases.
 
 Requires:
     pip install requests
@@ -40,16 +33,16 @@ except Exception:
 # Configuration — these IDs are specific to your Notion workspace.
 # ---------------------------------------------------------------------------
 
-# The Task database
-DATABASE_ID = "44c27f2c884583e88c8e01469bbf4615"
+# The Task DATA SOURCE (not the database container — the table inside it).
+DATA_SOURCE_ID = "16727f2c884583a6bf398738a4305ada"
 
-# The "Task section (Academics and Personal)" page that holds the toggle
+# The "Task section (Academics and Personal)" page that holds the toggle.
 PARENT_PAGE_ID = "f9c27f2c8845823a837201565a531822"
 
-# Substring used to identify the toggle to update on the parent page
+# Substring used to identify the toggle to update on the parent page.
 TOGGLE_TITLE_CONTAINS = "Task Status Tracker"
 
-# Status property and the three buckets we count
+# Status property and the three buckets we count.
 STATUS_PROPERTY = "Status (1)"
 STATUSES = ["To do", "In progress", "Done"]
 
@@ -59,6 +52,7 @@ STATUSES = ["To do", "In progress", "Done"]
 # ---------------------------------------------------------------------------
 
 API_BASE = "https://api.notion.com/v1"
+NOTION_VERSION = "2025-09-03"
 
 
 def _headers() -> dict[str, str]:
@@ -71,13 +65,13 @@ def _headers() -> dict[str, str]:
         sys.exit(1)
     return {
         "Authorization": f"Bearer {token}",
-        "Notion-Version": "2022-06-28",
+        "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
     }
 
 
 def query_all_tasks() -> list[dict[str, Any]]:
-    """Return every page in the task database (handles pagination)."""
+    """Return every page in the task data source (handles pagination)."""
     tasks: list[dict[str, Any]] = []
     cursor: str | None = None
     while True:
@@ -85,11 +79,15 @@ def query_all_tasks() -> list[dict[str, Any]]:
         if cursor:
             body["start_cursor"] = cursor
         r = requests.post(
-            f"{API_BASE}/databases/{DATABASE_ID}/query",
+            f"{API_BASE}/data_sources/{DATA_SOURCE_ID}/query",
             headers=_headers(),
             json=body,
             timeout=30,
         )
+        if not r.ok:
+            sys.stderr.write(
+                f"Query failed ({r.status_code}): {r.text}\n"
+            )
         r.raise_for_status()
         data = r.json()
         tasks.extend(data["results"])
@@ -252,7 +250,7 @@ def build_tracker_blocks(counts: dict[str, int]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    print("→ Querying task database…")
+    print("→ Querying task data source…")
     tasks = query_all_tasks()
     print(f"  Found {len(tasks)} tasks.")
 
