@@ -1,0 +1,32 @@
+name: Daily Task Reminder
+
+on:
+  schedule:
+    # 21:00 UTC = 5pm EDT (March–early November during daylight saving)
+    - cron: '0 21 * * *'
+    # 22:00 UTC = 5pm EST (early November–March)
+    - cron: '0 22 * * *'
+  workflow_dispatch:
+    # Lets you click "Run workflow" in the Actions tab to test on demand.
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install --quiet requests
+
+      - name: Run daily reminder
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NTFY_TOPIC_URL: ${{ secrets.NTFY_TOPIC_URL }}
+        run: python daily_reminder.py
+
