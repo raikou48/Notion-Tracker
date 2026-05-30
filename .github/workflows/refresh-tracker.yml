@@ -27,5 +27,6 @@ jobs:
       - name: Run refresh script
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          SHEETS_WEB_APP_URL: ${{ secrets.SHEETS_WEB_APP_URL }}
         run: python refresh_tracker.py
 
