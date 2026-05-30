@@ -3,16 +3,15 @@
 refresh_tracker.py
 ==================
 
-Refreshes BOTH "Task Status Tracker" and "Task Type Tracker" toggles
-on the Task section (Academics and Personal) page.
+Two jobs per run:
 
-  • Task Status Tracker — counts EVERY active task by Status
-      (Not started / In progress / Done)
-  • Task Type Tracker   — counts ACTIVE tasks excluding Done by Type
-      (Personal / Academic / Academic & Personal)
+  1. Refresh the Task Status Tracker + Task Type Tracker toggles on
+     the Task section (Academics and Personal) page.
 
-Archived and trashed tasks are filtered out from every tracker, so the
-totals match what you actually see in your Notion view.
+  2. Back up every task — including the notes inside it — to the
+     Google Sheet via the Apps Script web app endpoint. The Sheet is
+     append-only: deletions in Notion never propagate; the last-known
+     state of each task is preserved.
 
 Requires: pip install requests
 """
@@ -67,6 +66,8 @@ TRACKERS: list[dict[str, Any]] = [
 API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2025-09-03"
 
+SHEETS_WEB_APP_URL = os.environ.get("SHEETS_WEB_APP_URL", "")
+
 
 def _headers() -> dict[str, str]:
     token = os.environ.get("NOTION_TOKEN")
@@ -81,12 +82,11 @@ def _headers() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Notion API helpers
+# Notion fetching
 # ---------------------------------------------------------------------------
 
 def query_all_tasks() -> list[dict[str, Any]]:
-    """Return every active (non-archived, non-trashed) task in the data source."""
-    raw: list[dict[str, Any]] = []
+    tasks: list[dict[str, Any]] = []
     cursor: str | None = None
     while True:
         body: dict[str, Any] = {"page_size": 100}
@@ -94,29 +94,100 @@ def query_all_tasks() -> list[dict[str, Any]]:
             body["start_cursor"] = cursor
         r = requests.post(
             f"{API_BASE}/data_sources/{DATA_SOURCE_ID}/query",
-            headers=_headers(),
-            json=body,
-            timeout=30,
+            headers=_headers(), json=body, timeout=30,
         )
         if not r.ok:
             sys.stderr.write(f"Query failed ({r.status_code}): {r.text}\n")
         r.raise_for_status()
         data = r.json()
-        raw.extend(data["results"])
+        tasks.extend(data["results"])
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")
+    return tasks
 
-    # Strip archived / trashed pages. Notion's query returns them by default.
-    active = [
-        t for t in raw
-        if not t.get("in_trash", False) and not t.get("archived", False)
-    ]
-    dropped = len(raw) - len(active)
-    if dropped:
-        print(f"  Filtered out {dropped} archived/trashed task(s).")
-    return active
 
+def fetch_block_children(block_id: str) -> list[dict[str, Any]]:
+    children: list[dict[str, Any]] = []
+    cursor: str | None = None
+    while True:
+        url = f"{API_BASE}/blocks/{block_id}/children?page_size=100"
+        if cursor:
+            url += f"&start_cursor={cursor}"
+        r = requests.get(url, headers=_headers(), timeout=30)
+        if not r.ok:
+            return children
+        data = r.json()
+        children.extend(data["results"])
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    return children
+
+
+def blocks_to_text(blocks: list[dict[str, Any]], depth: int = 0) -> str:
+    """Convert a block tree to plain text. Limits recursion to depth 2."""
+    lines: list[str] = []
+    indent = "  " * depth
+    for block in blocks:
+        bt = block.get("type")
+        if not bt:
+            continue
+        data = block.get(bt, {}) or {}
+        rich = data.get("rich_text") or []
+        text = "".join((rt.get("plain_text") or "") for rt in rich)
+
+        if bt == "heading_1":
+            lines.append(f"{indent}# {text}")
+        elif bt == "heading_2":
+            lines.append(f"{indent}## {text}")
+        elif bt == "heading_3":
+            lines.append(f"{indent}### {text}")
+        elif bt == "bulleted_list_item":
+            lines.append(f"{indent}• {text}")
+        elif bt == "numbered_list_item":
+            lines.append(f"{indent}- {text}")
+        elif bt == "to_do":
+            mark = "[x]" if data.get("checked") else "[ ]"
+            lines.append(f"{indent}{mark} {text}")
+        elif bt == "quote":
+            lines.append(f"{indent}> {text}")
+        elif bt == "toggle":
+            lines.append(f"{indent}▸ {text}")
+        elif bt == "code":
+            lines.append(f"{indent}```\n{indent}{text}\n{indent}```")
+        elif bt == "callout":
+            lines.append(f"{indent}💬 {text}")
+        elif bt == "divider":
+            lines.append(f"{indent}---")
+        elif bt == "paragraph":
+            lines.append(f"{indent}{text}" if text else "")
+        elif text:
+            lines.append(f"{indent}{text}")
+
+        if depth < 2 and block.get("has_children"):
+            try:
+                child_blocks = fetch_block_children(block["id"])
+                child_text = blocks_to_text(child_blocks, depth + 1)
+                if child_text:
+                    lines.append(child_text)
+            except Exception:
+                pass
+
+    return "\n".join(line for line in lines if line is not None)
+
+
+def fetch_task_notes(task_id: str) -> str:
+    try:
+        blocks = fetch_block_children(task_id)
+        return blocks_to_text(blocks).strip()
+    except Exception as e:
+        return f"(error fetching notes: {e})"
+
+
+# ---------------------------------------------------------------------------
+# Property extraction
+# ---------------------------------------------------------------------------
 
 def get_status_name(task: dict[str, Any]) -> str | None:
     prop = (task.get("properties") or {}).get("Status") or {}
@@ -152,21 +223,65 @@ def count_by_property(
     return counts
 
 
+def extract_task_data(task: dict[str, Any]) -> dict[str, Any]:
+    props = task.get("properties") or {}
+
+    # Title (the "Task" property)
+    title_prop = props.get("Task") or {}
+    title_arr = title_prop.get("title") or []
+    task_title = "".join((rt.get("plain_text") or "") for rt in title_arr)
+
+    # Status
+    status = ""
+    sp = props.get("Status") or {}
+    if sp.get("type") == "status":
+        status = ((sp.get("status") or {}).get("name")) or ""
+
+    # Category
+    category = ""
+    cp = props.get("Category") or {}
+    if cp.get("type") == "select":
+        category = ((cp.get("select") or {}).get("name")) or ""
+
+    # Type (multi_select → comma-joined)
+    tp = props.get("Type") or {}
+    type_names: list[str] = []
+    if tp.get("type") == "multi_select":
+        type_names = [
+            opt.get("name") for opt in (tp.get("multi_select") or [])
+            if opt.get("name")
+        ]
+    type_value = ", ".join(type_names)
+
+    # Due Date
+    due_date = ""
+    dp = props.get("Due Date") or {}
+    if dp.get("type") == "date":
+        due_date = ((dp.get("date") or {}).get("start")) or ""
+
+    # Notes (page body content)
+    notes = fetch_task_notes(task["id"])
+
+    now = datetime.datetime.now(LOCAL_TZ) if LOCAL_TZ else datetime.datetime.utcnow()
+
+    return {
+        "id": task["id"],
+        "task": task_title,
+        "status": status,
+        "category": category,
+        "type": type_value,
+        "due_date": due_date,
+        "notes": notes,
+        "last_synced": now.isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Notion block manipulation (for tracker rewrite)
+# ---------------------------------------------------------------------------
+
 def list_block_children(block_id: str) -> list[dict[str, Any]]:
-    children: list[dict[str, Any]] = []
-    cursor: str | None = None
-    while True:
-        url = f"{API_BASE}/blocks/{block_id}/children?page_size=100"
-        if cursor:
-            url += f"&start_cursor={cursor}"
-        r = requests.get(url, headers=_headers(), timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        children.extend(data["results"])
-        if not data.get("has_more"):
-            break
-        cursor = data.get("next_cursor")
-    return children
+    return fetch_block_children(block_id)
 
 
 def delete_block(block_id: str) -> None:
@@ -196,10 +311,6 @@ def find_toggle(title_contains: str) -> str | None:
                     return block["id"]
     return None
 
-
-# ---------------------------------------------------------------------------
-# Block construction
-# ---------------------------------------------------------------------------
 
 def _text(content: str, bold: bool = False) -> dict[str, Any]:
     rt: dict[str, Any] = {"type": "text", "text": {"content": content}}
@@ -239,7 +350,7 @@ def build_tracker_blocks(
         return f"{round(100 * n / total)}% of total" if total else "—"
 
     now = datetime.datetime.now(LOCAL_TZ) if LOCAL_TZ else datetime.datetime.utcnow()
-    timestamp = now.strftime("%b %d, %Y at %I:%M %p %Z").strip().rstrip()
+    timestamp = now.strftime("%b %d, %Y at %I:%M %p %Z").strip()
 
     refresh_parts = [
         _text("🔄 "),
@@ -253,12 +364,10 @@ def build_tracker_blocks(
 
     column_blocks = []
     for bucket in buckets:
-        emoji = bucket["emoji"]
-        label = bucket["label"]
-        n = counts.get(label, 0)
+        n = counts.get(bucket["label"], 0)
         column_blocks.append(
             _column([
-                _quote([_text(emoji), _text(label, bold=True)]),
+                _quote([_text(bucket["emoji"]), _text(bucket["label"], bold=True)]),
                 _heading_1(str(n)),
                 _paragraph([_text(pct(n))]),
             ])
@@ -273,7 +382,7 @@ def build_tracker_blocks(
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Tracker refresh
 # ---------------------------------------------------------------------------
 
 def refresh_tracker(tasks: list[dict[str, Any]], config: dict[str, Any]) -> None:
@@ -283,13 +392,12 @@ def refresh_tracker(tasks: list[dict[str, Any]], config: dict[str, Any]) -> None
     exclude_status = config.get("exclude_status") or []
     if exclude_status:
         filtered = [t for t in tasks if get_status_name(t) not in exclude_status]
-        excluded = len(tasks) - len(filtered)
         exclude_note = (
             "Active tasks only — excludes "
-            + " or ".join(f'\"{s}\"' for s in exclude_status)
+            + " or ".join(f"\"{s}\"" for s in exclude_status)
             + "."
         )
-        print(f"  Filtered out {excluded} task(s) with status in {exclude_status}.")
+        print(f"  Filtered out {len(tasks) - len(filtered)} task(s) with status in {exclude_status}.")
     else:
         filtered = tasks
         exclude_note = None
@@ -302,7 +410,7 @@ def refresh_tracker(tasks: list[dict[str, Any]], config: dict[str, Any]) -> None
 
     toggle_id = find_toggle(title)
     if not toggle_id:
-        print(f"  WARN: toggle '{title}' not found on the page; skipping.")
+        print(f"  WARN: toggle '{title}' not found; skipping.")
         return
 
     for child in list_block_children(toggle_id):
@@ -313,15 +421,55 @@ def refresh_tracker(tasks: list[dict[str, Any]], config: dict[str, Any]) -> None
     print("  Updated. ✓")
 
 
+# ---------------------------------------------------------------------------
+# Google Sheets backup
+# ---------------------------------------------------------------------------
+
+def push_to_sheet(tasks_data: list[dict[str, Any]]) -> None:
+    if not SHEETS_WEB_APP_URL:
+        print("  SHEETS_WEB_APP_URL not set; skipping backup.")
+        return
+
+    try:
+        r = requests.post(
+            SHEETS_WEB_APP_URL,
+            json={"tasks": tasks_data},
+            timeout=60,
+            allow_redirects=True,
+        )
+        if r.ok:
+            try:
+                result = r.json()
+                print(
+                    f"  Sheet backup: inserted {result.get('inserted', 0)}, "
+                    f"updated {result.get('updated', 0)}."
+                )
+            except Exception:
+                print(f"  Sheet backup: HTTP {r.status_code} (non-JSON response)")
+        else:
+            print(f"  Sheet backup FAILED: HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"  Sheet backup error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     print("→ Querying Tasks data source…")
     tasks = query_all_tasks()
-    print(f"  {len(tasks)} active task(s).")
+    print(f"  Found {len(tasks)} tasks.")
 
     for config in TRACKERS:
         refresh_tracker(tasks, config)
 
-    print("\n→ All trackers refreshed. Done. ✓")
+    print("\n→ Backing up tasks (with notes) to Google Sheets…")
+    print(f"  Fetching notes for {len(tasks)} task(s)…")
+    tasks_data = [extract_task_data(t) for t in tasks]
+    push_to_sheet(tasks_data)
+
+    print("\n→ All done. ✓")
 
 
 if __name__ == "__main__":
