@@ -44,7 +44,7 @@ REMINDER_PROPERTY = "Daily 5pm Reminder"
 TITLE_PROPERTY = "Task"
 STATUS_PROPERTY = "Status"
 
-TARGET_HOUR_ET = 21  # 5pm Eastern
+TARGET_HOUR_ET = 17  # 5pm Eastern
 
 
 def _headers() -> dict[str, str]:
