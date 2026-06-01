@@ -3,15 +3,14 @@
 daily_reminder.py
 =================
 
-Fires once a day at 5:00 PM Eastern Time. Queries the Tasks data source,
-finds every task with "Daily 5pm Reminder" checked AND Status != "Done",
-and sends a push notification via ntfy.sh.
+Fires push notifications at 5 PM and 9 PM Eastern Time daily.
+Each time slot has its own checkbox property in the Tasks database:
 
-Workflow notes:
-  • Scheduled at both 21:00 UTC and 22:00 UTC so the script catches 5pm
-    ET regardless of daylight saving. The hour-gate below ensures only
-    the run that lands exactly on hour 17 ET actually sends.
-  • If no tasks are flagged, no notification is sent.
+  • "Daily 5pm Reminder" → fires at 5 PM ET
+  • "Daily 9pm Reminder" → fires at 9 PM ET
+
+Only active (non-Done) tasks with the relevant checkbox ticked get
+notified. Adding more time slots is just adding to the REMINDERS list.
 
 Requires: pip install requests
 """
@@ -40,11 +39,13 @@ DATA_SOURCE_ID = "122cd9978dee4c0b83ed4722a007a841"
 API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2025-09-03"
 
-REMINDER_PROPERTY = "Daily 5pm Reminder"
-TITLE_PROPERTY = "Task"
-STATUS_PROPERTY = "Status"
-
-TARGET_HOUR_ET = 17  # 5pm Eastern
+# Each entry: ET hour to fire, the checkbox property to check, and a label.
+# To add another slot (e.g. 8 AM), just append here and add the cron + checkbox.
+REMINDERS = [
+    {"hour": 11, "property": "Daily 11am Reminder", "label": "11 AM"},
+    {"hour": 17, "property": "Daily 5pm Reminder", "label": "5 PM"},
+    {"hour": 21, "property": "Daily 9pm Reminder", "label": "9 PM"},
+]
 
 
 def _headers() -> dict[str, str]:
@@ -72,9 +73,7 @@ def query_all_tasks() -> list[dict[str, Any]]:
             body["start_cursor"] = cursor
         r = requests.post(
             f"{API_BASE}/data_sources/{DATA_SOURCE_ID}/query",
-            headers=_headers(),
-            json=body,
-            timeout=30,
+            headers=_headers(), json=body, timeout=30,
         )
         r.raise_for_status()
         data = r.json()
@@ -86,9 +85,9 @@ def query_all_tasks() -> list[dict[str, Any]]:
 
 
 def get_title(task: dict[str, Any]) -> str:
-    prop = (task.get("properties") or {}).get(TITLE_PROPERTY) or {}
+    prop = (task.get("properties") or {}).get("Task") or {}
     arr = prop.get("title") or []
-    return "".join((rt.get("plain_text") or "") for rt in arr).strip() or "(untitled task)"
+    return "".join((rt.get("plain_text") or "") for rt in arr).strip() or "(untitled)"
 
 
 def get_checkbox(task: dict[str, Any], name: str) -> bool:
@@ -99,7 +98,7 @@ def get_checkbox(task: dict[str, Any], name: str) -> bool:
 
 
 def get_status(task: dict[str, Any]) -> str:
-    prop = (task.get("properties") or {}).get(STATUS_PROPERTY) or {}
+    prop = (task.get("properties") or {}).get("Status") or {}
     if prop.get("type") != "status":
         return ""
     return ((prop.get("status") or {}).get("name")) or ""
@@ -110,7 +109,7 @@ def get_task_url(task: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# ntfy.sh push
+# ntfy.sh
 # ---------------------------------------------------------------------------
 
 def send_ntfy(message: str, title: str, click_url: str | None = None) -> None:
@@ -119,7 +118,7 @@ def send_ntfy(message: str, title: str, click_url: str | None = None) -> None:
         sys.stderr.write("ERROR: NTFY_TOPIC_URL is not set.\n")
         sys.exit(1)
 
-    headers = {
+    headers: dict[str, Any] = {
         "Title": title.encode("utf-8"),
         "Priority": "default",
         "Tags": "bell",
@@ -143,52 +142,57 @@ def send_ntfy(message: str, title: str, click_url: str | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if EASTERN:
-        now_et = datetime.datetime.now(EASTERN)
-    else:
-        now_et = datetime.datetime.utcnow()
-
+    now_et = datetime.datetime.now(EASTERN) if EASTERN else datetime.datetime.utcnow()
+    current_hour = now_et.hour
     print(f"Current Eastern time: {now_et.strftime('%Y-%m-%d %H:%M %Z')}")
 
-    if now_et.hour != TARGET_HOUR_ET:
-        print(f"  Not the {TARGET_HOUR_ET}:00 ET hour. Skipping (this is normal — the "
-              f"other scheduled run handles the active timezone offset).")
+    # Find which reminder slot(s) match the current hour.
+    active_slots = [r for r in REMINDERS if r["hour"] == current_hour]
+
+    if not active_slots:
+        hours = ", ".join(str(r["hour"]) + ":00" for r in REMINDERS)
+        print(f"  Current hour ({current_hour}:00) doesn't match any slot ({hours}). Skipping.")
         return
 
     print("→ Querying tasks…")
     tasks = query_all_tasks()
     print(f"  Found {len(tasks)} tasks.")
 
-    flagged = [
-        t for t in tasks
-        if get_checkbox(t, REMINDER_PROPERTY) and get_status(t) != "Done"
-    ]
+    for slot in active_slots:
+        label = slot["label"]
+        prop = slot["property"]
+        print(f"\n→ {label} reminder (checking '{prop}')…")
 
-    if not flagged:
-        print("  No active tasks have a Daily 5pm Reminder. Nothing to send.")
-        return
+        flagged = [
+            t for t in tasks
+            if get_checkbox(t, prop) and get_status(t) != "Done"
+        ]
 
-    print(f"  {len(flagged)} task(s) flagged for reminder.")
-    for t in flagged:
-        print(f"   • {get_title(t)}")
+        if not flagged:
+            print(f"  No active tasks have '{prop}' checked. Nothing to send.")
+            continue
 
-    if len(flagged) == 1:
-        t = flagged[0]
-        send_ntfy(
-            message=get_title(t),
-            title="📌 Daily reminder",
-            click_url=get_task_url(t) or None,
-        )
-    else:
-        lines = ["You have these tasks to do:"]
+        print(f"  {len(flagged)} task(s) flagged:")
         for t in flagged:
-            lines.append(f"• {get_title(t)}")
-        send_ntfy(
-            message="\n".join(lines),
-            title=f"📌 Daily reminder — {len(flagged)} tasks",
-        )
+            print(f"   • {get_title(t)}")
 
-    print("  Sent. ✓")
+        if len(flagged) == 1:
+            t = flagged[0]
+            send_ntfy(
+                message=get_title(t),
+                title=f"📌 {label} reminder",
+                click_url=get_task_url(t) or None,
+            )
+        else:
+            lines = ["You have these tasks to do:"]
+            for t in flagged:
+                lines.append(f"• {get_title(t)}")
+            send_ntfy(
+                message="\n".join(lines),
+                title=f"📌 {label} reminder — {len(flagged)} tasks",
+            )
+
+        print(f"  Sent. ✓")
 
 
 if __name__ == "__main__":
