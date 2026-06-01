@@ -2,12 +2,16 @@ name: Daily Task Reminder
 
 on:
   schedule:
-    # 21:00 UTC = 5pm EDT (March–early November during daylight saving)
-    - cron: '0 21 * * *'
-    # 22:00 UTC = 5pm EST (early November–March)
-    - cron: '0 22 * * *'
+    # 11 AM ET coverage:
+    - cron: '0 15 * * *'   # 15:00 UTC = 11am EDT (Mar–Nov)
+    - cron: '0 16 * * *'   # 16:00 UTC = 11am EST (Nov–Mar)
+    # 5 PM ET coverage:
+    - cron: '0 21 * * *'   # 21:00 UTC = 5pm EDT (Mar–Nov)
+    - cron: '0 22 * * *'   # 22:00 UTC = 5pm EST (Nov–Mar)
+    # 9 PM ET coverage:
+    - cron: '0 1 * * *'    # 01:00 UTC = 9pm EDT (Mar–Nov)
+    - cron: '0 2 * * *'    # 02:00 UTC = 9pm EST (Nov–Mar)
   workflow_dispatch:
-    # Lets you click "Run workflow" in the Actions tab to test on demand.
 
 jobs:
   remind:
